@@ -1,6 +1,9 @@
 import numpy as np
 import networkx as nx
-import triangle as tr
+try:
+    import triangle as tr
+except ImportError:  # only needed to generate D-Hydro meshes (create_mesh_triangle, Mesh._import_from_Triangle)
+    tr = None
 import os
 import matplotlib as mpl
 from matplotlib.collections import PatchCollection
@@ -19,8 +22,12 @@ from torch_geometric.utils import to_undirected
 from torch_geometric.utils import scatter
 from shapely.geometry import Polygon
 import xarray as xr
-from meshkernel import MeshKernel, Mesh2d, GeometryList, OrthogonalizationParameters, ProjectToLandBoundaryOption, MeshRefinementParameters
-from meshkernel import py_structures, DeleteMeshOption
+try:
+    from meshkernel import MeshKernel, Mesh2d, GeometryList, OrthogonalizationParameters, ProjectToLandBoundaryOption, MeshRefinementParameters
+    from meshkernel import py_structures, DeleteMeshOption
+except ImportError:  # only needed to generate D-Hydro meshes (create_mesh_dhydro, Mesh._import_from_meshkernel)
+    MeshKernel = Mesh2d = GeometryList = OrthogonalizationParameters = None
+    ProjectToLandBoundaryOption = MeshRefinementParameters = py_structures = DeleteMeshOption = None
 
 def center_grid_graph(dim1, dim2, grid_size=1):
     '''
