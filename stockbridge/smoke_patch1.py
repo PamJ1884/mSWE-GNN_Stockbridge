@@ -2,6 +2,13 @@
 
 No training. Run from anywhere:
     python stockbridge/smoke_patch1.py [--dataset-root ...] [--output-dir ...]
+                                       [--previous-t 2,3]
+
+previous_t: the paper default is 2 and config.yaml says 3; the smoke tests both
+(--previous-t, comma-separated, default "2,3"). The hierarchy and the
+normalisation statistics do not depend on previous_t and are built once per
+number of scales; steps 3-5 are repeated for every (scales, previous_t) pair
+and reported under report["forward"]["S{scales}_p{previous_t}"].
 
 Steps
   1. Imports of the original model without meshkernel/triangle.
@@ -9,10 +16,12 @@ Steps
      connected components per scale; one-parent check; comparison with the
      expected node counts (reported, never forced).
   3. Samples of one train event (R019 if it is in train, else the first train
-     event) at t = 0 and t = 12, plus a layout check against use_prediction.
-  4. Original MSGNN (hyperparameters from config.yaml, previous_t = 2) with
-     random weights: forward per sample (shape, NaN, time, peak memory) for 4
-     and 5 scales.
+     event) at t = 0 and t = 12, plus a layout check against use_prediction
+     and a check that at t = 0 the dynamic columns of the steps before 0 are
+     zero (dry bed), for every previous_t.
+  4. Original MSGNN (hyperparameters from config.yaml, previous_t from
+     --previous-t) with random weights: forward per sample (shape, NaN, time,
+     peak memory) for 4 and 5 scales and every previous_t.
   5. Batch of 2 samples with the PyG DataLoader + adapt_batch_training, and a
      check that the batched output equals the single-sample outputs.
   6. smoke_report.json, normalisation_stats_S{4,5}.json and a node-map figure.
@@ -21,6 +30,7 @@ Steps
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import platform
@@ -46,7 +56,6 @@ from stockbridge.multiscale_grid import (  # noqa: E402
 from stockbridge import dataset as sbd  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = Path.home() / "flood/03_outputs/mSWE-GNN_Stockbridge/patch1_smoke_v01"
-PREVIOUS_T = 2
 
 
 def parse_args():
@@ -56,6 +65,8 @@ def parse_args():
     p.add_argument("--event", default="R019", help="preferred train event")
     p.add_argument("--times", default="0,12")
     p.add_argument("--scales", default="4,5")
+    p.add_argument("--previous-t", default="2,3",
+                   help="comma-separated previous_t values to test (paper default 2, config.yaml 3)")
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
     p.add_argument("--overwrite", action="store_true")
@@ -73,7 +84,7 @@ def rss_peak_mb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # Linux: KiB
 
 
-def build_model(config_path: Path, num_node_features, num_edge_features, num_scales, device):
+def build_model(config_path: Path, num_node_features, num_edge_features, num_scales, previous_t, device):
     from models.gnn import MSGNN
     cfg = yaml.safe_load(config_path.read_text())
     params = dict(cfg["models"])
@@ -83,7 +94,7 @@ def build_model(config_path: Path, num_node_features, num_edge_features, num_sca
         num_node_features=num_node_features,
         num_edge_features=num_edge_features,
         num_scales=num_scales,
-        previous_t=PREVIOUS_T,  # config.yaml says 3; patch 1 uses 2 (decided with the user)
+        previous_t=previous_t,  # paper default 2, config.yaml 3: the smoke tests both
         device=device,
         **params,
     ).to(device)
@@ -140,6 +151,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     times = [int(t) for t in args.times.split(",")]
     scales = [int(s) for s in args.scales.split(",")]
+    previous_ts = [int(p) for p in args.previous_t.split(",")]
+    if any(p < 1 for p in previous_ts):
+        sys.exit(f"--previous-t values must be >= 1, got {previous_ts}")
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
 
     report = {
@@ -148,7 +162,7 @@ def main():
         "torch": torch.__version__,
         "device": str(device),
         "dataset_root": str(args.dataset_root),
-        "previous_t": PREVIOUS_T,
+        "previous_t_values": previous_ts,
     }
 
     # 1. imports -----------------------------------------------------------------
@@ -180,7 +194,8 @@ def main():
     builders = {}
     report["hierarchy"] = {}
     for S in scales:
-        b = sbd.StockbridgeMultiscale(dem, num_scales=S, train_event_ids=train_ids, previous_t=PREVIOUS_T)
+        # grid and normalisation stats do not depend on previous_t: build once per S
+        b = sbd.StockbridgeMultiscale(dem, num_scales=S, train_event_ids=train_ids)
         builders[S] = b
         g = b.grid
         expected = list(EXPECTED_NODES_PER_SCALE[:S])
@@ -208,72 +223,85 @@ def main():
     event = sbd.load_event(args.dataset_root, "train", event_id)
     report["forward"] = {}
     for S in scales:
-        b = builders[S]
-        node_event = b.event_to_nodes(event)
-        samples = {t: b.build_sample(node_event, t) for t in sorted(set(times + [0, 1]))}
+        node_event = builders[S].event_to_nodes(event)  # independent of previous_t
+        for p in previous_ts:
+            key = f"S{S}_p{p}"
+            # shallow copy shares grid, static features and stats; only previous_t changes
+            b = copy.copy(builders[S])
+            b.previous_t = p
+            samples = {t: b.build_sample(node_event, t) for t in sorted(set(times + [0, 1]))}
 
-        # layout check: x(t=1) dynamics == use_prediction(x(t=0), y(t=0))
-        shifted = use_prediction(samples[0].x, samples[0].y[:, :, 0], PREVIOUS_T)
-        layout_ok = bool(torch.equal(shifted, samples[1].x))
+            # layout check: x(t=1) dynamics == use_prediction(x(t=0), y(t=0))
+            shifted = use_prediction(samples[0].x, samples[0].y[:, :, 0], p)
+            layout_ok = bool(torch.equal(shifted, samples[1].x))
+            # t = 0: dynamic columns of the p-1 steps before 0 must be zero (dry bed)
+            n_static = b.x_static.shape[1]
+            assert samples[0].x.shape[1] == n_static + 2 * p, "unexpected x width"
+            pre_zero = samples[0].x[:, n_static:n_static + 2 * (p - 1)]
+            pre_zero_ok = bool((pre_zero == 0).all())  # vacuously True when p == 1
 
-        model, params, cfg_prev_t = build_model(
-            args.config, samples[0].x.shape[1], samples[0].edge_attr.shape[1], S, device)
-        n_params = sum(p.numel() for p in model.parameters())
-        res = {"layout_matches_use_prediction": layout_ok, "num_parameters": n_params,
-               "model_params": params, "config_previous_t": cfg_prev_t, "samples": {}}
-        print(f"\n[S={S}] x {tuple(samples[0].x.shape)} edge_attr {tuple(samples[0].edge_attr.shape)} "
-              f"y {tuple(samples[0].y.shape)} | layout == use_prediction: {layout_ok} | params {n_params}")
+            model, params, cfg_prev_t = build_model(
+                args.config, samples[0].x.shape[1], samples[0].edge_attr.shape[1], S, p, device)
+            n_params = sum(q.numel() for q in model.parameters())
+            res = {"num_scales": S, "previous_t": p,
+                   "layout_matches_use_prediction": layout_ok,
+                   "t0_pre_start_dynamics_zero": pre_zero_ok,
+                   "num_parameters": n_params,
+                   "model_params": params, "config_previous_t": cfg_prev_t, "samples": {}}
+            print(f"\n[{key}] x {tuple(samples[0].x.shape)} edge_attr {tuple(samples[0].edge_attr.shape)} "
+                  f"y {tuple(samples[0].y.shape)} | layout == use_prediction: {layout_ok} | "
+                  f"t=0 pre-start dynamics zero: {pre_zero_ok} | params {n_params}")
 
-        singles = {}
-        for t in times:
-            d = samples[t].clone().to(device)  # Data.to works in place; keep the CPU samples for batching
-            # warm-up so the timing does not include CUDA initialisation
-            if device.type == "cuda":
-                with torch.no_grad():
-                    model(d)
-            out, dt, mem = timed_forward(model, d, device)
-            singles[t] = out.detach().cpu()
-            info = {
-                "output_shape": list(out.shape),
-                "has_nan": bool(torch.isnan(out).any()),
-                "seconds": dt,
-                "peak_memory_mb": mem,
-                "memory_kind": "cuda max_memory_allocated" if device.type == "cuda" else "CPU RSS peak",
-                "rain_a_mps": float(d.rain_a), "rain_b_mps": float(d.rain_b),
-                "rain_interval_mm": float(d.rain_interval_m) * 1000,
-                "scale0_H_max_input": float(d.x[:d.node_ptr[1], -2].max()),
-                "scale0_H_max_target": float(d.y[:d.node_ptr[1], 0, 0].max()),
-                "scale0_H_max_pred": float(out[:d.node_ptr[1], 0].max()),
+            singles = {}
+            for t in times:
+                d = samples[t].clone().to(device)  # Data.to works in place; keep the CPU samples for batching
+                # warm-up so the timing does not include CUDA initialisation
+                if device.type == "cuda":
+                    with torch.no_grad():
+                        model(d)
+                out, dt, mem = timed_forward(model, d, device)
+                singles[t] = out.detach().cpu()
+                info = {
+                    "output_shape": list(out.shape),
+                    "has_nan": bool(torch.isnan(out).any()),
+                    "seconds": dt,
+                    "peak_memory_mb": mem,
+                    "memory_kind": "cuda max_memory_allocated" if device.type == "cuda" else "CPU RSS peak",
+                    "rain_a_mps": float(d.rain_a), "rain_b_mps": float(d.rain_b),
+                    "rain_interval_mm": float(d.rain_interval_m) * 1000,
+                    "scale0_H_max_input": float(d.x[:d.node_ptr[1], -2].max()),
+                    "scale0_H_max_target": float(d.y[:d.node_ptr[1], 0, 0].max()),
+                    "scale0_H_max_pred": float(out[:d.node_ptr[1], 0].max()),
+                }
+                res["samples"][t] = info
+                print(f"[{key}] t={t:2d} out {tuple(out.shape)} NaN {info['has_nan']} "
+                      f"{dt*1000:.1f} ms peak {mem:.0f} MB | rain {info['rain_interval_mm']:.3f} mm/interval")
+
+            # batch of 2
+            loader = DataLoader([samples[t] for t in times[:2]], batch_size=2, shuffle=False)
+            batch = next(iter(loader))
+            temp = adapt_batch_training(batch).to(device)
+            out_b, dt_b, mem_b = timed_forward(model, temp, device)
+            out_b = out_b.cpu()
+            N = b.num_nodes
+            diffs = [float((out_b[i * N:(i + 1) * N] - singles[t]).abs().max()) for i, t in enumerate(times[:2])]
+            res["batch2"] = {
+                "output_shape": list(out_b.shape),
+                "has_nan": bool(torch.isnan(out_b).any()),
+                "seconds": dt_b,
+                "peak_memory_mb": mem_b,
+                "node_ptr": temp.node_ptr.tolist(),
+                "edge_ptr": temp.edge_ptr.tolist(),
+                "intra_edge_ptr": temp.intra_edge_ptr.tolist(),
+                "max_abs_diff_vs_single": diffs,
+                "matches_single": all(d < 1e-4 for d in diffs),
             }
-            res["samples"][t] = info
-            print(f"[S={S}] t={t:2d} out {tuple(out.shape)} NaN {info['has_nan']} "
-                  f"{dt*1000:.1f} ms peak {mem:.0f} MB | rain {info['rain_interval_mm']:.3f} mm/interval")
-
-        # batch of 2
-        loader = DataLoader([samples[t] for t in times[:2]], batch_size=2, shuffle=False)
-        batch = next(iter(loader))
-        temp = adapt_batch_training(batch).to(device)
-        out_b, dt_b, mem_b = timed_forward(model, temp, device)
-        out_b = out_b.cpu()
-        N = b.num_nodes
-        diffs = [float((out_b[i * N:(i + 1) * N] - singles[t]).abs().max()) for i, t in enumerate(times[:2])]
-        res["batch2"] = {
-            "output_shape": list(out_b.shape),
-            "has_nan": bool(torch.isnan(out_b).any()),
-            "seconds": dt_b,
-            "peak_memory_mb": mem_b,
-            "node_ptr": temp.node_ptr.tolist(),
-            "edge_ptr": temp.edge_ptr.tolist(),
-            "intra_edge_ptr": temp.intra_edge_ptr.tolist(),
-            "max_abs_diff_vs_single": diffs,
-            "matches_single": all(d < 1e-4 for d in diffs),
-        }
-        print(f"[S={S}] batch2 out {tuple(out_b.shape)} NaN {res['batch2']['has_nan']} "
-              f"{dt_b*1000:.1f} ms peak {mem_b:.0f} MB | max|batched-single| {diffs}")
-        report["forward"][S] = res
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            print(f"[{key}] batch2 out {tuple(out_b.shape)} NaN {res['batch2']['has_nan']} "
+                  f"{dt_b*1000:.1f} ms peak {mem_b:.0f} MB | max|batched-single| {diffs}")
+            report["forward"][key] = res
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     (out_dir / "smoke_report.json").write_text(json.dumps(report, indent=2, default=str))
     print(f"\nWrote {out_dir / 'smoke_report.json'}")

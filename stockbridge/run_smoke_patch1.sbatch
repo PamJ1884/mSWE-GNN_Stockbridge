@@ -57,6 +57,7 @@ apptainer exec --nv "$SIF" python stockbridge/smoke_patch1.py \
     --event R019 \
     --times 0,12 \
     --scales 4,5 \
+    --previous-t 2,3 \
     --device auto
 
 echo "===== Done ====="
