@@ -11,7 +11,9 @@ number of scales; steps 3-5 are repeated for every (scales, previous_t) pair
 and reported under report["forward"]["S{scales}_p{previous_t}"].
 
 Steps
-  1. Imports of the original model without meshkernel/triangle.
+  1. Imports of the original model without meshkernel, triangle, shapely,
+     xarray, pandas, wandb or lightning (batching helpers come from
+     stockbridge/batching.py, a copy of training/train.py without lightning).
   2. Hierarchy with 4 and 5 scales: nodes, edges, inter-scale pairs and
      connected components per scale; one-parent check; comparison with the
      expected node counts (reported, never forced).
@@ -172,7 +174,7 @@ def main():
     report["triangle_installed"] = importlib.util.find_spec("triangle") is not None
     from models.gnn import MSGNN  # noqa: F401
     from utils.dataset import use_prediction
-    from training.train import adapt_batch_training
+    from stockbridge.batching import adapt_batch_training  # copy of training/train.py (no lightning)
     from torch_geometric.loader import DataLoader
     report["imports_ok"] = True
     print(f"imports ok | meshkernel installed: {report['meshkernel_installed']} | "

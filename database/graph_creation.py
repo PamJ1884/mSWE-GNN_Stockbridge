@@ -20,8 +20,14 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
 from torch_geometric.utils import scatter
-from shapely.geometry import Polygon
-import xarray as xr
+try:
+    from shapely.geometry import Polygon
+except ImportError:  # only needed for random polygon generation (generate_polygon)
+    Polygon = None
+try:
+    import xarray as xr
+except ImportError:  # only needed to read D-Hydro NetCDF output (Mesh._import_from_map_netcdf, convert_mesh_to_pyg)
+    xr = None
 try:
     from meshkernel import MeshKernel, Mesh2d, GeometryList, OrthogonalizationParameters, ProjectToLandBoundaryOption, MeshRefinementParameters
     from meshkernel import py_structures, DeleteMeshOption

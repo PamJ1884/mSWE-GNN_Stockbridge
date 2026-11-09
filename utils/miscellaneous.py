@@ -1,9 +1,15 @@
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:  # only needed for CSV/DataFrame helpers (get_numerical_times, plot_line_with_deviation, ...)
+    pd = None
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from torch_geometric.utils import scatter
-from wandb import Config
+try:
+    from wandb import Config
+except ImportError:  # only needed for wandb sweeps (fix_dict_in_config)
+    Config = None
 
 from database.graph_creation import MultiscaleMesh
 from utils.dataset import to_temporal_dataset, get_inflow_volume, create_scale_mask
