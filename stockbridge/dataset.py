@@ -55,6 +55,7 @@ are copied instead of imported because that module hard-codes checks for the
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from pathlib import Path
@@ -171,6 +172,31 @@ def interval_rainfall(event: dict, t: int, alignment: str = "alternative") -> tu
     raise ValueError(f"Unknown rainfall alignment {alignment!r}")
 
 
+def interval_rainfall_tensors(event: dict, t: int, alignment: str = "alternative"):
+    """Tensor version of `interval_rainfall`: (1,) slices of rainfall_extended.
+
+    Indexing keeps the rain on the device of `rainfall_extended`, so building a
+    sample on the GPU needs neither a host sync nor a host-to-device copy.
+    """
+    rain = event["rainfall_extended"]
+    if alignment == "original":
+        return rain[t:t + 1], rain[t + 1:t + 2]
+    if alignment == "alternative":
+        return rain[t + 1:t + 2], rain[t + 2:t + 3]
+    raise ValueError(f"Unknown rainfall alignment {alignment!r}")
+
+
+def node_event_to(node_event: dict, device) -> dict:
+    """Copy of a node event (output of event_to_nodes) with its tensors on `device`.
+
+    Pool on the CPU (event_to_nodes) and then move: CUDA index_add_ sums with
+    atomics, so pooling on the GPU gives float32 round-off differences
+    (~1e-7 relative) on the coarse rows, while CPU pooling + this move gives
+    samples bit-identical to the CPU ones.
+    """
+    return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in node_event.items()}
+
+
 # ---- static features and normalisation --------------------------------------
 
 def _zscore_stats(values: np.ndarray) -> dict:
@@ -262,6 +288,27 @@ class StockbridgeMultiscale:
         self._ancestors = [torch.from_numpy(a).long() for a in g.ancestors]
         self._counts = [torch.bincount(a).float()[:, None] for a in self._ancestors]
 
+    _TENSOR_ATTRS = ("x_static", "edge_attr", "edge_index", "intra_mesh_edge_index", "node_ptr",
+                     "edge_ptr", "intra_edge_ptr", "flat_index0")
+
+    @property
+    def device(self) -> torch.device:
+        return self.x_static.device
+
+    def to(self, device) -> "StockbridgeMultiscale":
+        """Shallow copy whose static tensors (features, edges, pointers, pooling
+        indices) live on `device`. The numpy grid and the stats are shared.
+        Samples built by the copy are created on `device` without host copies
+        (move the node events with `node_event_to`)."""
+        device = torch.device(device)
+        out = copy.copy(self)
+        for name in self._TENSOR_ATTRS:
+            setattr(out, name, getattr(self, name).to(device))
+        out._ancestors = [a.to(device) for a in self._ancestors]
+        out._counts = [c.to(device) for c in self._counts]
+        out.__dict__.pop("_pooling_cache", None)
+        return out
+
     @property
     def num_nodes(self) -> int:
         return self.grid.num_nodes
@@ -274,7 +321,8 @@ class StockbridgeMultiscale:
             blocks = [v0]
             for s in range(1, self.grid.num_scales):
                 n_s = self._counts[s].shape[0]
-                pooled = torch.zeros(n_s, v0.shape[1], dtype=v0.dtype).index_add_(0, self._ancestors[s], v0)
+                pooled = torch.zeros(n_s, v0.shape[1], dtype=v0.dtype, device=v0.device).index_add_(
+                    0, self._ancestors[s], v0)
                 blocks.append(pooled / self._counts[s])
             out[name] = torch.cat(blocks, 0)
         out["event_id"] = event["event_id"]
@@ -312,7 +360,11 @@ class StockbridgeMultiscale:
         return torch.cat(blocks, 0)
 
     def build_sample(self, node_event: dict, t: int) -> Data:
-        """Teacher-forced sample for the step t -> t+1 (0 <= t <= NT-2)."""
+        """Teacher-forced sample for the step t -> t+1 (0 <= t <= NT-2).
+
+        Every tensor is created on the builder's device (see `to`); the node
+        event must be on the same device (see `node_event_to`).
+        """
         if not 0 <= t <= NT - 2:
             raise ValueError(f"t must satisfy 0 <= t <= {NT - 2}, got {t}")
         p = self.previous_t
@@ -320,13 +372,14 @@ class StockbridgeMultiscale:
         dyn = []
         for k in range(t - p + 1, t + 1):  # oldest first, as get_previous_steps
             if k < 0:  # dry bed before the start of the event
-                dyn += [torch.zeros(H.shape[0], 1), torch.zeros(H.shape[0], 1)]
+                zeros = torch.zeros(H.shape[0], 1, dtype=H.dtype, device=H.device)
+                dyn += [zeros, zeros]
             else:
                 dyn += [H[:, k:k + 1], Q[:, k:k + 1]]
         x = torch.cat([self.x_static] + dyn, dim=1)
         y = torch.stack([H[:, t + 1], Q[:, t + 1]], dim=1).unsqueeze(-1)  # (N, 2, 1)
 
-        rain_a, rain_b = interval_rainfall(node_event, t, self.rainfall_alignment)
+        rain_a, rain_b = interval_rainfall_tensors(node_event, t, self.rainfall_alignment)
         data = Data(
             x=x,
             y=y,
@@ -338,16 +391,19 @@ class StockbridgeMultiscale:
         data.node_ptr = self.node_ptr
         data.edge_ptr = self.edge_ptr
         data.intra_edge_ptr = self.intra_edge_ptr
-        data.rain_a = torch.tensor([rain_a], dtype=torch.float32)
-        data.rain_b = torch.tensor([rain_b], dtype=torch.float32)
-        data.rain_interval_m = torch.tensor([0.5 * (rain_a + rain_b) * DT_SECONDS], dtype=torch.float32)
+        # same values as float32(python float) before: the sum is done in the
+        # rain dtype (float64) and cast once
+        data.rain_a = rain_a.to(torch.float32)
+        data.rain_b = rain_b.to(torch.float32)
+        data.rain_interval_m = (0.5 * (rain_a + rain_b) * DT_SECONDS).to(torch.float32)
         data.time = t
         data.event_id = node_event["event_id"]
         data.previous_t = p
         data.temporal_res = TEMPORAL_RES_MIN
         # boundary-condition placeholders (no inflow boundary in a rainfall domain)
-        data.node_BC = torch.zeros(0, dtype=torch.long)
+        dev = self.device
+        data.node_BC = torch.zeros(0, dtype=torch.long, device=dev)
         data.type_BC = 2
-        data.BC = torch.zeros(0, p, 2)
-        data.edge_BC_length = torch.zeros(0)
+        data.BC = torch.zeros(0, p, 2, device=dev)
+        data.edge_BC_length = torch.zeros(0, device=dev)
         return data
