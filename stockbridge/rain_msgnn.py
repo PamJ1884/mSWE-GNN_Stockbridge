@@ -122,6 +122,24 @@ def constrain_state(pred: torch.Tensor) -> torch.Tensor:
     return torch.stack([h, q], dim=1)
 
 
+def module_groups(model) -> dict:
+    """Named sub-modules of an MSGNN / RainMSGNN for per-module gradient diagnostics."""
+    S = model.num_scales
+    groups = {
+        "edge_encoder": model.edge_encoder,
+        "static_node_encoder": model.static_node_encoder,
+        "dynamic_node_encoder": model.dynamic_node_encoder,
+    }
+    for s, mod in enumerate(getattr(model, "rain_forcing_modules", [])):
+        groups[f"rain_forcing_s{s}"] = mod
+    for i, mod in enumerate(model.gnn_processor):
+        groups[f"processor_down_s{i}" if i < S - 1 else f"processor_up_s{2 * S - 2 - i}"] = mod
+    for i, mod in enumerate(model.intra_scale_gnn):
+        groups[f"intra_scale_s{S - 1 - i}_to_s{S - 2 - i}"] = mod
+    groups["node_decoder"] = model.node_decoder
+    return groups
+
+
 class MultiplicativeRainForcing(nn.Module):
     """r * g(h_s, rain) with r = W_r rain (no bias): exactly 0 when rain = 0."""
 

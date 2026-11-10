@@ -80,7 +80,7 @@ import yaml  # noqa: E402
 from stockbridge import dataset as sbd  # noqa: E402
 from stockbridge.batching import adapt_batch_training  # noqa: E402
 from stockbridge.rain_msgnn import (  # noqa: E402
-    RainMSGNN, constrain_state, node_graph_index, rain_features)
+    RainMSGNN, constrain_state, module_groups, node_graph_index, rain_features)
 from stockbridge.rollout import rollout  # noqa: E402
 from stockbridge.smoke_patch1 import git_commit, rss_peak_mb  # noqa: E402
 
@@ -250,23 +250,6 @@ def reference_models(ctx):
 
 
 # ---- module groups for gradient norms ---------------------------------------
-
-def module_groups(model):
-    S = model.num_scales
-    groups = {
-        "edge_encoder": model.edge_encoder,
-        "static_node_encoder": model.static_node_encoder,
-        "dynamic_node_encoder": model.dynamic_node_encoder,
-    }
-    for s, mod in enumerate(getattr(model, "rain_forcing_modules", [])):
-        groups[f"rain_forcing_s{s}"] = mod
-    for i, mod in enumerate(model.gnn_processor):
-        groups[f"processor_down_s{i}" if i < S - 1 else f"processor_up_s{2 * S - 2 - i}"] = mod
-    for i, mod in enumerate(model.intra_scale_gnn):
-        groups[f"intra_scale_s{S - 1 - i}_to_s{S - 2 - i}"] = mod
-    groups["node_decoder"] = model.node_decoder
-    return groups
-
 
 def grad_norms(model):
     out = {}

@@ -33,6 +33,10 @@ Gradients: the function does not wrap anything in `torch.no_grad`. Call it
 inside `torch.no_grad()` for evaluation; call it normally to backpropagate
 through the whole rollout (patch 3). `detach_between_steps=True` cuts the
 graph between steps (one-step gradients only, less memory).
+`checkpoint_steps=True` wraps every model call in torch.utils.checkpoint
+(non-reentrant): only each step's input is kept and the step's activations
+are recomputed during backward (more compute, much less memory). It has no
+effect when gradients are disabled.
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from __future__ import annotations
 import copy
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from stockbridge.dataset import NT
 from stockbridge.rain_msgnn import constrain_state as default_constrain_state
@@ -47,7 +52,8 @@ from utils.dataset import use_prediction
 
 
 def rollout(model, builder, node_event: dict, t0: int = 0, n_steps: int | None = None,
-            previous_t: int | None = None, device=None, detach_between_steps: bool = False) -> dict:
+            previous_t: int | None = None, device=None, detach_between_steps: bool = False,
+            checkpoint_steps: bool = False) -> dict:
     """Roll the model out for n_steps from the CityCAT state at t0.
 
     model: maps a sample to a raw [H, Q] prediction (N, 2). Its
@@ -83,7 +89,10 @@ def rollout(model, builder, node_event: dict, t0: int = 0, n_steps: int | None =
             data = data.to(device)
         if x is not None:
             data.x = x
-        out = model(data)
+        if checkpoint_steps and torch.is_grad_enabled():
+            out = checkpoint(model, data, use_reentrant=False)
+        else:
+            out = model(data)
         state = constrain(out)
         raw.append(out)
         constrained.append(state)
