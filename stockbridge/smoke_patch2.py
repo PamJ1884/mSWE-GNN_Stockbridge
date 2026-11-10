@@ -38,7 +38,14 @@ smoke_report.json; a FAIL or an exception does not stop the script):
      times) -> batched output equals single outputs, so each graph uses its
      own rain.
   6. Rollout of 24 steps with random weights from T0: no NaN / no explosion;
-     per step H max, scale-0 mean H, predicted vs CityCAT volume.
+     per step H max, scale-0 mean H, predicted vs CityCAT volume, and max |H|
+     on the coarse rows of each step's input (they must follow the fine
+     prediction, not drift).
+  6b. Rollout with an oracle: a fake model returns the CityCAT scale-0
+     target (and 1e3 on coarse rows). Over 24 steps the input x of every
+     step must equal builder.build_sample(node_event, t).x (max abs diff
+     <= 1e-6), i.e. the rollout rebuilds coarse rows from the fine state
+     exactly as event_to_nodes does.
   7. Overfit: 200 Adam steps (lr 1e-3) on T0 -> T1 and on T12 -> T13, fine
      and all_scales, loss RMSE(H) + RMSE(Q) on scale 0 (raw output).
      PASS if the final loss is finite and below half the initial one. Also
@@ -451,9 +458,14 @@ def check_rollout(checks, name, ctx, event_id):
     details, ok, msgs = {}, True, []
     for cfg, kw in RAIN_CONFIGS.items():
         m = build_rain(ctx, **kw).eval()
+        coarse_h = []  # per step: max |H| of the latest input step, per coarse scale
+        hook = m.register_forward_pre_hook(lambda mod, args: coarse_h.append(coarse_input_h_max(ctx, args[0].x)))
         t0 = time.perf_counter()
-        with torch.no_grad():
-            ro = rollout(m, ctx.builder, ev["node_event"], t0=0, n_steps=steps, device=ctx.device)
+        try:
+            with torch.no_grad():
+                ro = rollout(m, ctx.builder, ev["node_event"], t0=0, n_steps=steps, device=ctx.device)
+        finally:
+            hook.remove()
         dt = time.perf_counter() - t0
         raw = ro["raw"].cpu()
         h = ro["constrained"][:, :n0, 0].cpu().double()
@@ -468,14 +480,76 @@ def check_rollout(checks, name, ctx, event_id):
             "volume_citycat_m3": (th * area0).sum(1).tolist(),
             "rain_cumulative_volume_m3": (torch.cumsum(ro["rain_interval_m"].cpu().double(), 0)
                                           * float(area0.sum())).tolist(),
+            "input_t": [t - 1 for t in ro["times"]],
+            "input_coarse_abs_H_max_per_scale_m": coarse_h,
+            "input_coarse_abs_H_max_m": [max(v) for v in coarse_h],
         }
         exploded = bool(hmax.max() > ctx.explode_h)
         good = finite and not exploded
         ok &= good
         details[cfg] = {"finite": finite, "exploded": exploded, "seconds": dt, "per_step": per_step}
         msgs.append(f"{cfg}: finite {finite}, H max {float(hmax.max()):.3f} m, final volume "
-                    f"{per_step['volume_pred_m3'][-1]:.0f} vs CityCAT {per_step['volume_citycat_m3'][-1]:.0f} m3")
+                    f"{per_step['volume_pred_m3'][-1]:.0f} vs CityCAT {per_step['volume_citycat_m3'][-1]:.0f} m3, "
+                    f"coarse input |H| max {max(per_step['input_coarse_abs_H_max_m']):.3f} m")
     checks.record(name, "PASS" if ok else "FAIL", f"{event_id} {steps} steps | " + " | ".join(msgs), details)
+
+
+def coarse_input_h_max(ctx, x):
+    """max |H| of the latest input step (column -2) on each coarse scale."""
+    ptr = ctx.builder.node_ptr.tolist()
+    h = x[:, -2].detach()
+    return [float(h[ptr[s]:ptr[s + 1]].abs().max()) for s in range(1, len(ptr) - 1)]
+
+
+class CityCATOracle(nn.Module):
+    """Fake model for check 6b: returns the CityCAT target on scale 0 and garbage on coarse rows."""
+
+    def __init__(self, n0, coarse_value=1e3):
+        super().__init__()
+        self.n0 = n0
+        self.coarse_value = coarse_value
+        self.inputs = []
+
+    def forward(self, graph):
+        self.inputs.append(graph.x.detach().clone())
+        out = torch.full((graph.x.shape[0], 2), self.coarse_value, dtype=graph.x.dtype, device=graph.x.device)
+        out[:self.n0] = graph.y[:self.n0, :, 0]
+        return out
+
+    @staticmethod
+    def constrain_state(pred):
+        return constrain_state(pred)
+
+
+def check_rollout_oracle(checks, name, ctx, event_id):
+    ev = ctx.events[event_id]
+    n0 = n0_of(ctx)
+    steps = min(ctx.rollout_steps, sbd.NT - 1)
+    oracle = CityCATOracle(n0)
+    with torch.no_grad():
+        rollout(oracle, ctx.builder, ev["node_event"], t0=0, n_steps=steps, device=ctx.device)
+    ptr = ctx.builder.node_ptr.tolist()
+    diffs, diffs_fine, diffs_coarse = [], [], []
+    for k, x in enumerate(oracle.inputs):
+        ref = ctx.builder.build_sample(ev["node_event"], k).x
+        d = (x.cpu() - ref).abs()
+        diffs.append(float(d.max()))
+        diffs_fine.append(float(d[:ptr[1]].max()))
+        diffs_coarse.append(float(d[ptr[1]:].max()))
+    # constrain_state sets Q = 0 where H = 0; CityCAT nodes with Q > 0 and H = 0 would differ for a data reason
+    H, Q = ev["node_event"]["H"][:n0], ev["node_event"]["Qmag"][:n0]
+    q_where_dry = int(((Q > 0) & (H <= 0)).sum())
+    tol = 1e-6
+    ok = max(diffs) <= tol
+    worst = int(np.argmax(diffs))
+    details = {"steps": steps, "tolerance": tol, "max_abs_diff_per_input_t": diffs,
+               "max_abs_diff_fine_rows": diffs_fine, "max_abs_diff_coarse_rows": diffs_coarse,
+               "citycat_scale0_Q_pos_where_H_zero": q_where_dry}
+    msg = (f"{event_id} {steps} steps | max |x_rollout - x_build_sample| {max(diffs):.2e} (tol {tol:.0e}), "
+           f"worst input t={worst} (fine {diffs_fine[worst]:.2e}, coarse {diffs_coarse[worst]:.2e})")
+    if q_where_dry:
+        msg += f" | NOTE: {q_where_dry} CityCAT scale-0 entries with Q > 0 and H = 0"
+    checks.record(name, "PASS" if ok else "FAIL", msg, details)
 
 
 def rmse_hq(out, y, n0):
@@ -579,6 +653,8 @@ def run_all_checks(checks, ctx):
     checks.run("5_batch_own_rain", check_batch, ctx)
     for e in ctx.events:
         checks.run(f"6_rollout/{e}", check_rollout, ctx, e)
+    for e in ctx.events:
+        checks.run(f"6b_rollout_oracle/{e}", check_rollout_oracle, ctx, e)
     for e in ctx.events:
         checks.run(f"7_overfit/{e}", check_overfit, ctx, e)
     checks.run("8_cost", check_cost, ctx, ctx.primary)

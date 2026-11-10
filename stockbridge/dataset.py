@@ -281,6 +281,36 @@ class StockbridgeMultiscale:
         out["rainfall_extended"] = event["rainfall_extended"]
         return out
 
+    def _pooling_tensors(self, device: torch.device):
+        """_ancestors / _counts on `device` (cached per device)."""
+        cache = self.__dict__.setdefault("_pooling_cache", {})
+        key = str(device)
+        if key not in cache:
+            cache[key] = ([a.to(device) for a in self._ancestors], [c.to(device) for c in self._counts])
+        return cache[key]
+
+    def fine_to_all_scales(self, state0: torch.Tensor) -> torch.Tensor:
+        """Full (N, C) state from the scale-0 state (n0, C), e.g. C = 2 for [H, Q].
+
+        Coarse rows are the area-weighted mean of the active scale-0
+        descendants, exactly as in `event_to_nodes` (every scale-0 cell has
+        the same area, so this is the plain mean over descendants). Pure
+        torch, differentiable, on the device and dtype of `state0`. Used in a
+        rollout so the coarse inputs follow the fine prediction instead of
+        the model's untrained coarse outputs.
+        """
+        n0 = self._counts[0].shape[0]
+        if state0.shape[0] != n0:
+            raise ValueError(f"state0 must have {n0} rows (scale 0), got {state0.shape[0]}")
+        ancestors, counts = self._pooling_tensors(state0.device)
+        blocks = [state0]
+        for s in range(1, self.grid.num_scales):
+            n_s = counts[s].shape[0]
+            pooled = torch.zeros(n_s, state0.shape[1], dtype=state0.dtype, device=state0.device)
+            pooled = pooled.index_add(0, ancestors[s], state0)
+            blocks.append(pooled / counts[s].to(state0.dtype))
+        return torch.cat(blocks, 0)
+
     def build_sample(self, node_event: dict, t: int) -> Data:
         """Teacher-forced sample for the step t -> t+1 (0 <= t <= NT-2)."""
         if not 0 <= t <= NT - 2:

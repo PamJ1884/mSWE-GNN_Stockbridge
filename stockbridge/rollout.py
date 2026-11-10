@@ -8,11 +8,26 @@ domain), and at every step:
   2. from the second step on, replaces its input `x` with the input built
      from the model's own predictions;
   3. runs the model, constrains the raw prediction with `constrain_state`
-     (H >= 0, Q >= 0, Q = 0 where H = 0) and feeds the constrained state to
-     the next input with the original `utils.dataset.use_prediction` (drops
-     the oldest [H, Q] pair and appends the prediction).
+     (H >= 0, Q >= 0, Q = 0 where H = 0), rebuilds the coarse rows from the
+     scale-0 rows (see below) and feeds that state to the next input with
+     the original `utils.dataset.use_prediction` (drops the oldest [H, Q]
+     pair and appends the prediction).
+
+Coarse rows of the fed-back state. The model predicts [H, Q] on every node,
+but the loss only uses scale 0, so the coarse predictions are never trained.
+They must not be fed back: with with_WL=True, WL = DEM + H is computed on
+every node and enters the static encoder, and the coarse static latent
+drives the coarse fluxes and the intra-scale GNN, so uncontrolled coarse H
+would contaminate the fine prediction and could drift over the rollout. In
+teacher forcing the coarse inputs are the area-weighted mean of the CityCAT
+scale-0 values (`StockbridgeMultiscale.event_to_nodes`); in the rollout they
+are the same mean of the constrained scale-0 prediction
+(`StockbridgeMultiscale.fine_to_all_scales`, differentiable).
 
 Raw predictions are returned too, because the loss is computed on them.
+The coarse rows of "raw" and "constrained" are returned as the model gave
+them (after constrain_state) but are not used: neither in the next input nor,
+by the convention of the smoke and training code, in the loss.
 
 Gradients: the function does not wrap anything in `torch.no_grad`. Call it
 inside `torch.no_grad()` for evaluation; call it normally to backpropagate
@@ -44,7 +59,8 @@ def rollout(model, builder, node_event: dict, t0: int = 0, n_steps: int | None =
     n_steps: defaults to every step until the end of the event (NT - 1 - t0).
 
     Returns a dict with tensors of shape (n_steps, N, 2):
-        raw, constrained, target (CityCAT at t+1),
+        raw, constrained (coarse rows unused, see the module docstring),
+        target (CityCAT at t+1),
     and times (the predicted time indices t0+1 ... t0+n_steps) and
     rain_interval_m (n_steps,).
     """
@@ -57,6 +73,7 @@ def rollout(model, builder, node_event: dict, t0: int = 0, n_steps: int | None =
     if t0 < 0 or n_steps < 1 or t0 + n_steps > NT - 1:
         raise ValueError(f"need 0 <= t0 and t0 + n_steps <= {NT - 1}, got t0={t0}, n_steps={n_steps}")
     constrain = getattr(model, "constrain_state", default_constrain_state)
+    n0 = int(builder.node_ptr[1])
 
     raw, constrained, target, rain = [], [], [], []
     x = None
@@ -72,10 +89,12 @@ def rollout(model, builder, node_event: dict, t0: int = 0, n_steps: int | None =
         constrained.append(state)
         target.append(data.y[:, :, 0])
         rain.append(data.rain_interval_m.reshape(()))
+        # coarse rows of the fed-back state = area-weighted mean of scale 0
+        fed_back = builder.fine_to_all_scales(state[:n0])
         if detach_between_steps:
-            x = use_prediction(data.x.detach(), state.detach(), p)
+            x = use_prediction(data.x.detach(), fed_back.detach(), p)
         else:
-            x = use_prediction(data.x, state, p)
+            x = use_prediction(data.x, fed_back, p)
 
     return {
         "raw": torch.stack(raw),
