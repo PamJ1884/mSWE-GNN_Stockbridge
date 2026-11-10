@@ -17,7 +17,10 @@ Copied from M17K (same behaviour)
 * `train_one_epoch`: k-step rollout per sample, loss = mean over steps,
   gradient accumulation over --accumulate-samples samples (the update uses
   the mean loss of the group), non-finite gradient check (raises), gradient
-  norm clipping, Adam, StepLR.
+  norm clipping, Adam, StepLR with step 7 epochs and gamma 0.9 (the original
+  mSWE-GNN schedule, documented as such in M17K: --lr-step-size 7
+  --lr-gamma 0.9). A step of 1 epoch would bring lr 1e-3 down to about
+  1.5e-5 by epoch 40, so the model would stop learning in the 6-step stage.
 * Loss: M17K --loss swegnn_rmse --loss-q-weight 3 --loss-mask where_water.
 * Validation: M17K `evaluate_rollout` (stockbridge/m17k_metrics.py), full
   T0 -> T24 rollout of every valid event from the dry T0.
@@ -147,7 +150,9 @@ def parse_args(argv=None):
     # optimisation
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--lr-step-size", type=int, default=1, help="StepLR step in epochs (0 = constant lr)")
+    p.add_argument("--lr-step-size", type=int, default=7,
+                   help="StepLR step in epochs (original mSWE-GNN / M17K: 7; 0 = constant lr). "
+                        "With --lr-gamma 0.9, lr 1e-3 is 4.8e-4 at epoch 50 and 2.3e-4 at epoch 100")
     p.add_argument("--lr-gamma", type=float, default=0.9)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     # validation and selection
