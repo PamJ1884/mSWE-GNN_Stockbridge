@@ -15,10 +15,12 @@
 # mSWE-GNN Stockbridge patch 3: pilot training of RainMSGNN (one GPU per array task).
 #
 # Array tasks (same seed, 4 scales, config.yaml hyperparameters):
-#   0  fine        previous_t 2   -> patch3_pilot_v01/fine/
-#   1  all_scales  previous_t 2   -> patch3_pilot_v01/all_scales/
-#   2  fine        previous_t 3   -> patch3_pilot_v01/fine_p3/
-#   3  all_scales  previous_t 3   -> patch3_pilot_v01/all_scales_p3/
+#   0  fine        previous_t 2   -> $OUTPUT_DIR/fine/
+#   1  all_scales  previous_t 2   -> $OUTPUT_DIR/all_scales/
+#   2  fine        previous_t 3   -> $OUTPUT_DIR/fine_p3/
+#   3  all_scales  previous_t 3   -> $OUTPUT_DIR/all_scales_p3/
+# (the phase 2 pilot used OUTPUT_DIR=$HOME/flood/03_outputs/mSWE-GNN_Stockbridge/patch3_pilot_v01
+#  and DATASET=$HOME/flood/02_data/CityCAT_Winchester/swegnn/stockbridge_phase2_100_5m_v01)
 #
 # Launch (from the repository root):
 #   sbatch stockbridge/run_pilot_patch3.sbatch                    # tasks 0-1 (p = 2), 12 h each
@@ -46,8 +48,13 @@ SEED=666  # models.seed of config.yaml, explicit so every task uses the same one
 
 REPO_DIR="$HOME/flood/01_repositories/mSWE-GNN_Stockbridge"
 SIF="$HOME/ResearchPam_HPC/containers/stockbridge_swegnn_pyg_torch212_cu121_v01.sif"
-DATASET="$HOME/flood/02_data/CityCAT_Winchester/swegnn/stockbridge_phase2_100_5m_v01"
-OUT_DIR="$HOME/flood/03_outputs/mSWE-GNN_Stockbridge/patch3_pilot_v01/$VARIANT"
+# DATASET and OUTPUT_DIR come from the environment (no default dataset), e.g.
+#   DATASET=$HOME/flood/02_data/CityCAT_Winchester/swegnn/stockbridge_phase2plus3_300_5m_v01 \
+#   OUTPUT_DIR=$HOME/flood/03_outputs/mSWE-GNN_Stockbridge/<pilot_name> \
+#   sbatch stockbridge/run_pilot_patch3.sbatch
+: "${DATASET:?set DATASET to the SWE-GNN dataset folder (e.g. swegnn/stockbridge_phase2plus3_300_5m_v01)}"
+: "${OUTPUT_DIR:?set OUTPUT_DIR to the output folder}"
+OUT_DIR="$OUTPUT_DIR/$VARIANT"
 
 cd "$REPO_DIR"
 module load apptainer/1.4.1

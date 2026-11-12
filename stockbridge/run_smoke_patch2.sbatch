@@ -18,8 +18,13 @@ set -euo pipefail
 
 REPO_DIR="$HOME/flood/01_repositories/mSWE-GNN_Stockbridge"
 SIF="$HOME/ResearchPam_HPC/containers/stockbridge_swegnn_pyg_torch212_cu121_v01.sif"
-DATASET="$HOME/flood/02_data/CityCAT_Winchester/swegnn/stockbridge_phase2_100_5m_v01"
-OUT_DIR="$HOME/flood/03_outputs/mSWE-GNN_Stockbridge/patch2_smoke_v01"
+# DATASET and OUTPUT_DIR come from the environment (no default dataset), e.g.
+#   DATASET=$HOME/flood/02_data/CityCAT_Winchester/swegnn/stockbridge_phase2plus3_300_5m_v01 \
+#   OUTPUT_DIR=$HOME/flood/03_outputs/mSWE-GNN_Stockbridge/<run_name> \
+#   sbatch stockbridge/run_smoke_patch2.sbatch
+: "${DATASET:?set DATASET to the SWE-GNN dataset folder (e.g. swegnn/stockbridge_phase2plus3_300_5m_v01)}"
+: "${OUTPUT_DIR:?set OUTPUT_DIR to the output folder}"
+OUT_DIR="$OUTPUT_DIR"
 
 cd "$REPO_DIR"
 module load apptainer/1.4.1
