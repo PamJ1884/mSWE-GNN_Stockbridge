@@ -1,7 +1,8 @@
 """Patch 3: pilot training of RainMSGNN on the Stockbridge CityCAT events.
 
 Run from anywhere:
-    python stockbridge/train_rain_msgnn.py --output-dir ... [--rain-injection fine|all_scales] [--smoke]
+    python stockbridge/train_rain_msgnn.py --dataset-root ... --output-dir ... \
+        [--rain-injection fine|all_scales] [--smoke [--smoke-events "train=R001,R101;valid=R002,R102"]]
 
 Reference: Stockbridge-SWEGNN, scripts/train_valid_stockbridge_m17k.py (stage 1,
 "M17K"; repository HEAD 9bb39d00d4d9044c67a96684bf0383faa51a4631, file last
@@ -56,15 +57,25 @@ What changes, and why
 * Per-module gradient norms (encoders, rain forcing per scale, processor
   per scale, intra-scale GNNs, decoder), before clipping, averaged over the
   optimiser steps of each epoch.
-* Baselines with the same metrics, computed once: dry persistence (should
-  reproduce the stage-1 0.0555 m H RMSE on valid) and the rain bucket
-  (H = accumulated rain, Q = 0).
-* The test split is never read.
+* Baselines with the same metrics, computed once on the valid events of the
+  run: dry persistence and the rain bucket (H = accumulated rain, Q = 0).
+  The dry persistence is the run's own baseline: it goes to config_used.json
+  and next to the validation metrics of every epoch in history.csv. The
+  stage-1 (M17K) reference numbers are only recorded when the valid events
+  are exactly the 15 phase 2 valid events they were computed on.
+* Maps of the best checkpoint: --map-events, or by default the valid event
+  with the most total rain (manifest.csv rainfall_raw_sum) of each phase
+  present in valid, so every seed maps the same events.
+* The test split is never read (only its event IDs, to reject test events).
+
+Phases: phase 2 = R001-R100, phase 3 = R101-R300
+(pt/stockbridge_phase2plus3_300_v01 manifest).
 
 --smoke: 2 train and 2 valid events, 2 epochs, 2 starts per event, schedule
 "1:1,2:rest" (so the multi-step path and a curriculum change are exercised),
 and a check that the dry-persistence metrics equal an independent by-hand
-computation.
+computation. Events: --smoke-events, else the first two of each split, or
+the first event of each phase when the split holds both phases.
 """
 
 from __future__ import annotations
@@ -107,7 +118,11 @@ STAGE1_VALID_REFERENCE = {
     "best_swegnn_P4_CSI_0p05_mean": 0.10,
     "best_swegnn_Qmag_peak_percent_of_citycat": "0.3-6",
 }
-DEFAULT_OUTPUT_ROOT = Path.home() / "flood/03_outputs/mSWE-GNN_Stockbridge/patch3_pilot_v01"
+# The 15 valid events STAGE1_VALID_REFERENCE was computed on (phase 2 valid split).
+PHASE2_VALID_IDS = ("R002", "R006", "R011", "R025", "R026", "R051", "R054", "R060", "R072", "R077",
+                    "R083", "R087", "R088", "R092", "R094")
+PHASE2_LAST_EVENT = 100  # phase 2 = R001-R100, phase 3 = R101-R300
+DRY_KEYS = ["H_RMSE_active_mean", "Qmag_RMSE_active_mean", "CSI_0p05_mean", "swegnn_val_loss"]
 VALID_KEYS = [
     "H_RMSE_active_mean", "Qmag_RMSE_active_mean", "CSI_0p01_mean", "CSI_0p05_mean", "CSI_0p10_mean",
     "H_peak_ratio_mean", "Qmag_peak_ratio_mean", "final_step_pred_over_true_volume_mean",
@@ -132,14 +147,44 @@ def parse_split_counts(text: str) -> dict[str, int]:
     return counts
 
 
+def event_phase(event_id: str) -> str:
+    return "phase2" if sbd._natural_event_key(event_id)[0] <= PHASE2_LAST_EVENT else "phase3"
+
+
+def parse_event_list(text: str) -> list[str]:
+    ids = [e.strip() for e in text.split(",") if e.strip()]
+    for e in ids:
+        try:
+            sbd._natural_event_key(e)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"bad event ID {e!r} (use e.g. R002,R106)") from None
+    if not ids or len(set(ids)) != len(ids):
+        raise argparse.ArgumentTypeError(f"need a non-empty list of distinct event IDs, got {text!r}")
+    return ids
+
+
+def parse_smoke_events(text: str) -> dict[str, list[str]]:
+    """'train=R001,R101;valid=R002,R102' -> {'train': [...], 'valid': [...]}."""
+    out = {}
+    for item in text.split(";"):
+        split, sep, ids = item.strip().partition("=")
+        split = split.strip()
+        if split == "test":
+            raise argparse.ArgumentTypeError("--smoke-events cannot use test events (the test split is never read)")
+        if not sep or split not in ("train", "valid") or split in out:
+            raise argparse.ArgumentTypeError(f"bad --smoke-events item {item!r} (use 'train=R..,R..;valid=R..,R..')")
+        out[split] = parse_event_list(ids)
+    return out
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--dataset-root", type=Path, default=sbd.DEFAULT_DATASET_ROOT)
+    p.add_argument("--dataset-root", type=Path, required=True,
+                   help="SWE-GNN dataset folder (static_graph.pt, manifest.json/csv, events/)")
     p.add_argument("--expected-split-counts", type=parse_split_counts, default=None,
                    help="e.g. 'train=70,valid=15' or 'train=210,valid=45': fail unless the dataset "
                         "has exactly these sizes (default: sizes from the dataset manifest/folders)")
-    p.add_argument("--output-dir", type=Path, default=None,
-                   help=f"default: {DEFAULT_OUTPUT_ROOT}/<injection>_p<previous_t>")
+    p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     p.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
@@ -180,15 +225,21 @@ def parse_args(argv=None):
     p.add_argument("--min-delta", type=float, default=1e-8)
     p.add_argument("--cell-area", type=float, default=25.0)
     p.add_argument("--map-times", default="6,12,24", help="target times of the best-checkpoint maps")
+    p.add_argument("--map-events", type=parse_event_list, default=None,
+                   help="valid event IDs mapped with the best checkpoint (default: the valid event with "
+                        "the most total rain of each phase present in valid, from manifest.csv)")
     p.add_argument("--smoke", action="store_true", help="2 train / 2 valid events, 2 epochs, 2 starts")
+    p.add_argument("--smoke-events", type=parse_smoke_events, default=None,
+                   help="with --smoke: 'train=R001,R101;valid=R002,R102' (default: first two of each "
+                        "split, or the first event of each phase when the split holds both)")
     args = p.parse_args(argv)
+    if args.smoke_events is not None and not args.smoke:
+        p.error("--smoke-events needs --smoke")
     if args.smoke:
         args.epochs = 2
         args.max_starts_per_event = 2
         args.rollout_schedule = "1:1,2:rest"
         args.valid_every = 1
-    if args.output_dir is None:
-        args.output_dir = DEFAULT_OUTPUT_ROOT / f"{args.rain_injection}_p{args.previous_t}"
     return args
 
 
@@ -273,21 +324,88 @@ def json_safe(v):
 
 # ---- data -------------------------------------------------------------------------
 
-def load_data(args):
+def manifest_rain_totals(root: Path) -> dict[str, float]:
+    """rainfall_raw_sum (sum of the 25 intensities, m/s) per event, from manifest.csv."""
+    path = Path(root) / "manifest.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} not found: needed to choose the map events")
+    with path.open(newline="") as f:
+        return {row["event_id"]: float(row["rainfall_raw_sum"]) for row in csv.DictReader(f)}
+
+
+def default_smoke_ids(ids: list[str]) -> list[str]:
+    """First two events, or the first event of each phase when both phases are present."""
+    by_phase = {}
+    for e in ids:  # ids are sorted: the first event of each phase
+        by_phase.setdefault(event_phase(e), e)
+    return [by_phase["phase2"], by_phase["phase3"]] if len(by_phase) == 2 else ids[:2]
+
+
+def default_map_events(valid_ids: list[str], rain: dict[str, float]) -> list[str]:
+    """Per phase present in valid, the event with the most total rain (ties: lowest ID)."""
+    out = []
+    for phase in ("phase2", "phase3"):
+        cands = [e for e in valid_ids if event_phase(e) == phase]
+        if cands:
+            out.append(max(cands, key=lambda e: (rain[e], -sbd._natural_event_key(e)[0])))
+    return out
+
+
+def resolve_events(args) -> dict:
+    """Event IDs of the run (train, valid, map events), checked before anything is written."""
+    root = args.dataset_root
+    if not (Path(root) / "static_graph.pt").is_file():
+        raise SystemExit(f"--dataset-root {root} has no static_graph.pt")
+    split_ids = {s: sbd.split_event_ids(root, s, args.expected_split_counts) for s in ("train", "valid")}
+    if set(split_ids["train"]) & set(split_ids["valid"]):
+        raise ValueError("train / valid overlap")
+    dataset_split_counts = {s: len(v) for s, v in split_ids.items()}
+    test_ids = set(sbd.split_event_ids(root, "test"))  # IDs only: no test event is loaded
+    ids = dict(split_ids)
+    smoke_selection = None
+    if args.smoke:
+        if args.smoke_events is not None:
+            for split, wanted in args.smoke_events.items():
+                for e in wanted:
+                    if e in test_ids:
+                        raise SystemExit(f"--smoke-events: {e} is a test event; the test split is never read")
+                    if e not in split_ids[split]:
+                        where = next((s for s in split_ids if e in split_ids[s]), None)
+                        raise SystemExit(f"--smoke-events: {e} is not in {split}"
+                                         + (f" (it is in {where})" if where else " (not in the dataset)"))
+            ids = {s: list(args.smoke_events.get(s, default_smoke_ids(split_ids[s]))) for s in split_ids}
+            smoke_selection = "--smoke-events"
+        else:
+            ids = {s: default_smoke_ids(v) for s, v in split_ids.items()}
+            smoke_selection = "default: first two, or first of each phase"
+    rain = manifest_rain_totals(root)
+    if args.map_events is not None:
+        for e in args.map_events:
+            if e not in split_ids["valid"]:
+                where = "test" if e in test_ids else ("train" if e in split_ids["train"] else "no split")
+                raise SystemExit(f"--map-events: {e} is not a valid event (it is in {where})")
+            if e not in ids["valid"]:
+                raise SystemExit(f"--map-events: {e} is a valid event but not one of this run's "
+                                 f"valid events {ids['valid']} (smoke)")
+        map_events, map_reason = list(args.map_events), "--map-events"
+    else:
+        map_events = default_map_events(ids["valid"], rain)
+        map_reason = "per phase present in valid, the event with the most total rain (manifest.csv rainfall_raw_sum)"
+    return {"train_ids": ids["train"], "valid_ids": ids["valid"], "dataset_split_counts": dataset_split_counts,
+            "smoke_selection": smoke_selection, "map_events": map_events, "map_events_reason": map_reason,
+            "event_phase": {e: event_phase(e) for e in ids["train"] + ids["valid"]},
+            "manifest_rain_totals": {e: rain[e] for e in ids["valid"]}}
+
+
+def load_data(args, events=None):
     """Train / valid node events pooled on the CPU. The test split is never read."""
     root = args.dataset_root
+    events = events if events is not None else resolve_events(args)
     dem, dem_meta = sbd.load_static_dem(root)
-    train_ids = sbd.split_event_ids(root, "train", args.expected_split_counts)
-    valid_ids = sbd.split_event_ids(root, "valid", args.expected_split_counts)
-    if set(train_ids) & set(valid_ids):
-        raise ValueError("train / valid overlap")
-    dataset_split_counts = {"train": len(train_ids), "valid": len(valid_ids)}
-    if args.smoke:
-        train_ids, valid_ids = train_ids[:2], valid_ids[:2]
+    train_ids, valid_ids = events["train_ids"], events["valid_ids"]
     builder = sbd.StockbridgeMultiscale(dem, num_scales=args.num_scales, train_event_ids=train_ids,
                                         previous_t=args.previous_t)
-    out = {"builder": builder, "train_ids": train_ids, "valid_ids": valid_ids, "dem_meta": dem_meta,
-           "dataset_split_counts": dataset_split_counts,
+    out = {"builder": builder, "dem_meta": dem_meta, **events,
            "train": [], "valid": [], "rain_total": {}}
     for split, ids in (("train", train_ids), ("valid", valid_ids)):
         for eid in ids:
@@ -557,6 +675,7 @@ def main(argv=None, data=None):
     out_dir: Path = args.output_dir
     if out_dir.exists() and any(out_dir.iterdir()) and not args.overwrite:
         sys.exit(f"Output directory {out_dir} is not empty; use --overwrite")
+    events = resolve_events(args) if data is None else None  # fails before anything is written
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available())
                           or args.device == "cuda" else "cpu")
@@ -572,7 +691,15 @@ def main(argv=None, data=None):
 
     # data on the device
     t_load = time.perf_counter()
-    data = data if data is not None else load_data(args)
+    data = data if data is not None else load_data(args, events)
+    valid_is_phase2_reference = sorted(data["valid_ids"]) == sorted(PHASE2_VALID_IDS)
+    stage1_reference = STAGE1_VALID_REFERENCE if valid_is_phase2_reference else None
+    stage1_note = ("valid events are the 15 phase 2 valid events of the stage-1 reference"
+                   if valid_is_phase2_reference else
+                   "null: the valid events are not the 15 phase 2 valid events the stage-1 (M17K) numbers "
+                   "were computed on; compare with dry_persistence_valid_baseline instead")
+    map_events = data.get("map_events") or default_map_events(data["valid_ids"], data["rain_total"])
+    print(f"Events: train {data['train_ids']} | valid {data['valid_ids']} | maps {map_events}", flush=True)
     builder_cpu = data["builder"]
     builder = builder_cpu.to(device)
     device_check = check_device_sample(builder_cpu, builder, data["train"][0],
@@ -598,9 +725,12 @@ def main(argv=None, data=None):
         "args": {k: json_safe(v) for k, v in vars(args).items()},
         "model_kwargs": kw, **sizes, "num_parameters": n_params, "schedule_per_epoch": schedule,
         "git_commit": git_commit(), "m17k_reference": M17K_REFERENCE,
-        "stage1_valid_reference": STAGE1_VALID_REFERENCE, "device": str(device), "host": platform.node(),
+        "stage1_valid_reference": stage1_reference, "stage1_valid_reference_note": stage1_note,
+        "device": str(device), "host": platform.node(),
         "torch": torch.__version__, "train_event_ids": data["train_ids"], "valid_event_ids": data["valid_ids"],
         "dataset_split_counts": data.get("dataset_split_counts"),
+        "event_phase": data.get("event_phase"), "smoke_selection": data.get("smoke_selection"),
+        "map_events": map_events, "map_events_reason": data.get("map_events_reason"),
         "nodes_per_scale": builder_cpu.grid.nodes_per_scale(), "device_sample_check": device_check,
         "data_load_seconds": load_seconds, "test_split_used": False,
     }
@@ -624,7 +754,6 @@ def main(argv=None, data=None):
         print("WARNING: even with checkpointing the rehearsal exceeds --max-gpu-mem-gb", flush=True)
     config["memory_rehearsal"] = rehearsal
     config["grad_checkpoint_used"] = use_ckpt
-    (out_dir / "config_used.json").write_text(json.dumps(config, indent=2, default=json_safe))
 
     # baselines (same metrics, once)
     t_b = time.perf_counter()
@@ -640,15 +769,22 @@ def main(argv=None, data=None):
                  if baselines["persistence_dry"]["summary"][k] != v}
         baselines["persistence_dry_by_hand_check"] = {"identical": not diffs, "differences": diffs, "by_hand": by_hand}
         print(f"Smoke check: dry persistence == by-hand computation: {not diffs} {diffs if diffs else ''}", flush=True)
-    baselines["stage1_valid_reference"] = STAGE1_VALID_REFERENCE
+    baselines["stage1_valid_reference"] = stage1_reference
+    baselines["stage1_valid_reference_note"] = stage1_note
     baselines["seconds"] = time.perf_counter() - t_b
     (out_dir / "baselines.json").write_text(json.dumps(baselines, indent=2, default=json_safe))
+    dry = baselines["persistence_dry"]["summary"]
+    config["dry_persistence_valid_baseline"] = {
+        "summary": dry, "valid_event_ids": data["valid_ids"],
+        "source": "m17k_metrics.evaluate_rollout(Persistence()) on this run's valid events"}
+    (out_dir / "config_used.json").write_text(json.dumps(config, indent=2, default=json_safe))
 
     # training
     fieldnames = (["epoch", "rollout_steps", "train_starts", "optimizer_steps", "lr", "train_loss_mean",
                    "train_loss_min", "train_loss_max", "mean_grad_norm", "train_seconds", "valid_seconds",
                    "epoch_seconds", "peak_mem_mb", "grad_checkpoint", "validated", "is_best", "best_epoch"]
-                  + [f"grad_{g}" for g in groups] + [f"valid_{k}" for k in VALID_KEYS])
+                  + [f"grad_{g}" for g in groups] + [f"valid_{k}" for k in VALID_KEYS]
+                  + [f"dry_{k}" for k in DRY_KEYS] + ["valid_H_RMSE_skill_vs_dry"])
     best_key, best_epoch, best_summary = (-math.inf, math.inf), 0, None
     since_improvement, early_stopped, epochs_completed = 0, False, 0
     info = {"git_commit": config["git_commit"], "model_kwargs": kw, **sizes, "num_scales": args.num_scales,
@@ -697,7 +833,10 @@ def main(argv=None, data=None):
                    "grad_checkpoint": use_ckpt, "validated": validated, "is_best": is_best,
                    "best_epoch": best_epoch,
                    **{f"grad_{g}": v for g, v in tr["grad_norm_by_module"].items()},
-                   **({f"valid_{key_}": summary[key_] for key_ in VALID_KEYS} if summary else {})}
+                   **({f"valid_{key_}": summary[key_] for key_ in VALID_KEYS} if summary else {}),
+                   **{f"dry_{key_}": dry[key_] for key_ in DRY_KEYS},
+                   "valid_H_RMSE_skill_vs_dry": (1.0 - summary["H_RMSE_active_mean"] / dry["H_RMSE_active_mean"]
+                                                 if summary and dry["H_RMSE_active_mean"] else None)}
             writer.writerow(row)
             hf.flush()
             vtxt = (f" | valid CSI0.05 {summary['CSI_0p05_mean']} H_RMSE {summary['H_RMSE_active_mean']:.5f} "
@@ -726,14 +865,16 @@ def main(argv=None, data=None):
         w.writerows(rows)
 
     ids = data["valid_ids"]
-    map_event = "R019" if "R019" in ids else max(ids, key=lambda e: data["rain_total"][e])
     times = [int(t) for t in args.map_times.split(",")]
-    ne = valid_events[ids.index(map_event)]
-    with torch.inference_mode():
-        fresh.eval()
-        ro = rollout(fresh, builder, ne, t0=0, n_steps=max(times))
-    map_path = out_dir / f"maps_best_{map_event}.png"
-    plot_maps(map_path, builder, ne, ro["constrained"], times, map_event)
+    map_paths = []
+    for map_event in map_events:
+        ne = valid_events[ids.index(map_event)]
+        with torch.inference_mode():
+            fresh.eval()
+            ro = rollout(fresh, builder, ne, t0=0, n_steps=max(times))
+        map_path = out_dir / f"maps_best_{map_event}.png"
+        plot_maps(map_path, builder, ne, ro["constrained"], times, map_event)
+        map_paths.append(map_path)
 
     best_metrics = {
         "best_epoch": best_epoch, "epochs_completed": epochs_completed, "early_stopped": early_stopped,
@@ -742,15 +883,17 @@ def main(argv=None, data=None):
         "reload_check": {"identical_to_training_validation": reload_identical,
                          "max_relative_diff": reload_rel, "within_1e-5": reload_ok, "abs_diff": reload_diffs},
         "baselines": {k: baselines[k]["summary"] for k in ("persistence_dry", "rain_bucket")},
-        "stage1_valid_reference": STAGE1_VALID_REFERENCE,
-        "map_event": map_event, "map_event_reason": "R019 in valid" if map_event == "R019" else "valid event with the most rain",
+        "dry_persistence_valid_baseline": dry,
+        "stage1_valid_reference": stage1_reference, "stage1_valid_reference_note": stage1_note,
+        "map_event": map_events[0], "map_events": map_events, "map_events_reason": data.get("map_events_reason"),
         "total_seconds": time.perf_counter() - run_start,
     }
     if device.type == "cuda":
         best_metrics["max_memory_allocated_mb"] = torch.cuda.max_memory_allocated(device) / 2**20
     (out_dir / "best_metrics.json").write_text(json.dumps(best_metrics, indent=2, default=json_safe))
     print(f"Best epoch {best_epoch}: CSI0.05 {summary['CSI_0p05_mean']} H_RMSE {summary['H_RMSE_active_mean']:.5f} "
-          f"| reload identical {reload_identical} (max rel diff {reload_rel:.1e}) | maps {map_path.name} | total "
+          f"| reload identical {reload_identical} (max rel diff {reload_rel:.1e}) | maps "
+          f"{', '.join(m.name for m in map_paths)} | total "
           f"{best_metrics['total_seconds']:.0f} s", flush=True)
     return best_metrics
 
