@@ -75,7 +75,7 @@ CELL_SIZE = 5.0
 DT_SECONDS = 300.0
 TEMPORAL_RES_MIN = 5
 EXPECTED_ACTIVE_CELLS = 32249
-EXPECTED_SPLIT_COUNTS = {"train": 70, "valid": 15, "test": 15}
+SPLITS = ("train", "valid", "test")
 STATIC_NODE_FEATURES = ["area", "DEM"]
 EDGE_FEATURES = ["edge_length", "edge_slope"]
 WATER_VARIABLES = ["H", "Qmag"]
@@ -115,8 +115,41 @@ def _natural_event_key(event_id: str) -> tuple[int, str]:
     return int(match.group(1)), event_id
 
 
-def split_event_ids(dataset_root: Path, split: str) -> list[str]:
-    """Event IDs of a split, from manifest.json if it lists them, else from files."""
+def split_counts(dataset_root: Path, split: str) -> int:
+    """Number of events of a split, read from the dataset itself.
+
+    Taken from `split_counts` of manifest.json when it has the split, else
+    counted from events/<split>/*.pt. When both exist they must agree.
+    """
+    dataset_root = Path(dataset_root)
+    manifest_count = None
+    manifest_path = dataset_root / "manifest.json"
+    if manifest_path.is_file():
+        counts = json.loads(manifest_path.read_text()).get("split_counts")
+        if isinstance(counts, dict) and split in counts:
+            manifest_count = int(counts[split])
+    folder_count = None
+    split_dir = dataset_root / "events" / split
+    if split_dir.is_dir():
+        folder_count = sum(1 for _ in split_dir.glob("*.pt"))
+    if manifest_count is not None and folder_count is not None and manifest_count != folder_count:
+        raise ValueError(f"{split}: manifest.json split_counts says {manifest_count} events, "
+                         f"{split_dir} has {folder_count}")
+    if manifest_count is None and folder_count is None:
+        raise FileNotFoundError(f"No split_counts[{split!r}] in {manifest_path} and no {split_dir}")
+    return manifest_count if manifest_count is not None else folder_count
+
+
+def split_event_ids(dataset_root: Path, split: str,
+                    expected_counts: dict[str, int] | None = None) -> list[str]:
+    """Event IDs of a split, from manifest.json if it lists them, else from files.
+
+    The expected size comes from the dataset (`split_counts`); with
+    `expected_counts` (e.g. {"train": 70, "valid": 15, "test": 15}) the size
+    must also equal expected_counts[split].
+    """
+    if split not in SPLITS:
+        raise ValueError(f"Unknown split {split!r}, expected one of {SPLITS}")
     dataset_root = Path(dataset_root)
     event_ids = None
     manifest_path = dataset_root / "manifest.json"
@@ -131,8 +164,12 @@ def split_event_ids(dataset_root: Path, split: str) -> list[str]:
             raise FileNotFoundError(f"Event split directory not found: {split_dir}")
         event_ids = [p.stem for p in split_dir.glob("*.pt")]
     event_ids = sorted(event_ids, key=_natural_event_key)
-    if len(event_ids) != EXPECTED_SPLIT_COUNTS[split]:
-        raise ValueError(f"Expected {EXPECTED_SPLIT_COUNTS[split]} {split} events, found {len(event_ids)}")
+    expected = split_counts(dataset_root, split)
+    if len(event_ids) != expected:
+        raise ValueError(f"Expected {expected} {split} events (dataset split_counts), found {len(event_ids)}")
+    if expected_counts is not None and split in expected_counts and expected_counts[split] != expected:
+        raise ValueError(f"{split}: dataset has {expected} events, --expected-split-counts says "
+                         f"{expected_counts[split]}")
     return event_ids
 
 
