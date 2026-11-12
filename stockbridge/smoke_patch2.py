@@ -1,7 +1,7 @@
 """Patch 2 smoke test: RainMSGNN (rain forcing inside the multiscale GNN).
 
 No training beyond a 200-step overfit of single transitions. Run from anywhere:
-    python stockbridge/smoke_patch2.py [--dataset-root ...] [--output-dir ...]
+    python stockbridge/smoke_patch2.py --dataset-root ... [--output-dir ...]
 
 Events: the first train event with rain > 0 in T0-T2 (interval rain of the
 step T0 -> T1 > 0), plus R001 from whatever split holds it. 4 scales,
@@ -91,7 +91,7 @@ RAIN_CONFIGS = {"fine": {"rain_injection": "fine"}, "all_scales": {"rain_injecti
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset-root", type=Path, default=sbd.DEFAULT_DATASET_ROOT)
+    p.add_argument("--dataset-root", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--extra-event", default="R001")
     p.add_argument("--scales", type=int, default=4)

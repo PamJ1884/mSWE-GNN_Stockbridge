@@ -1,7 +1,7 @@
 """Patch 1 smoke test: Stockbridge multiscale data + ORIGINAL MSGNN forward.
 
 No training. Run from anywhere:
-    python stockbridge/smoke_patch1.py [--dataset-root ...] [--output-dir ...]
+    python stockbridge/smoke_patch1.py --dataset-root ... [--output-dir ...]
                                        [--previous-t 2,3]
 
 previous_t: the paper default is 2 and config.yaml says 3; the smoke tests both
@@ -62,7 +62,7 @@ DEFAULT_OUTPUT_DIR = Path.home() / "flood/03_outputs/mSWE-GNN_Stockbridge/patch1
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset-root", type=Path, default=sbd.DEFAULT_DATASET_ROOT)
+    p.add_argument("--dataset-root", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--event", default="R019", help="preferred train event")
     p.add_argument("--times", default="0,12")
