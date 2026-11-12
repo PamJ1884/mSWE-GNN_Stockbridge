@@ -116,9 +116,28 @@ VALID_KEYS = [
 ]
 
 
+def parse_split_counts(text: str) -> dict[str, int]:
+    """'train=210,valid=45,test=45' -> {'train': 210, 'valid': 45, 'test': 45}."""
+    counts = {}
+    for item in text.split(","):
+        split, sep, value = item.strip().partition("=")
+        if not sep or split not in sbd.SPLITS or split in counts:
+            raise argparse.ArgumentTypeError(f"bad split count {item!r} (use e.g. train=210,valid=45)")
+        try:
+            counts[split] = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"bad split count {item!r}") from None
+        if counts[split] < 1:
+            raise argparse.ArgumentTypeError(f"split count must be >= 1: {item!r}")
+    return counts
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--dataset-root", type=Path, default=sbd.DEFAULT_DATASET_ROOT)
+    p.add_argument("--expected-split-counts", type=parse_split_counts, default=None,
+                   help="e.g. 'train=70,valid=15' or 'train=210,valid=45': fail unless the dataset "
+                        "has exactly these sizes (default: sizes from the dataset manifest/folders)")
     p.add_argument("--output-dir", type=Path, default=None,
                    help=f"default: {DEFAULT_OUTPUT_ROOT}/<injection>_p<previous_t>")
     p.add_argument("--overwrite", action="store_true")
@@ -258,15 +277,17 @@ def load_data(args):
     """Train / valid node events pooled on the CPU. The test split is never read."""
     root = args.dataset_root
     dem, dem_meta = sbd.load_static_dem(root)
-    train_ids = sbd.split_event_ids(root, "train")
-    valid_ids = sbd.split_event_ids(root, "valid")
+    train_ids = sbd.split_event_ids(root, "train", args.expected_split_counts)
+    valid_ids = sbd.split_event_ids(root, "valid", args.expected_split_counts)
     if set(train_ids) & set(valid_ids):
         raise ValueError("train / valid overlap")
+    dataset_split_counts = {"train": len(train_ids), "valid": len(valid_ids)}
     if args.smoke:
         train_ids, valid_ids = train_ids[:2], valid_ids[:2]
     builder = sbd.StockbridgeMultiscale(dem, num_scales=args.num_scales, train_event_ids=train_ids,
                                         previous_t=args.previous_t)
     out = {"builder": builder, "train_ids": train_ids, "valid_ids": valid_ids, "dem_meta": dem_meta,
+           "dataset_split_counts": dataset_split_counts,
            "train": [], "valid": [], "rain_total": {}}
     for split, ids in (("train", train_ids), ("valid", valid_ids)):
         for eid in ids:
@@ -579,6 +600,7 @@ def main(argv=None, data=None):
         "git_commit": git_commit(), "m17k_reference": M17K_REFERENCE,
         "stage1_valid_reference": STAGE1_VALID_REFERENCE, "device": str(device), "host": platform.node(),
         "torch": torch.__version__, "train_event_ids": data["train_ids"], "valid_event_ids": data["valid_ids"],
+        "dataset_split_counts": data.get("dataset_split_counts"),
         "nodes_per_scale": builder_cpu.grid.nodes_per_scale(), "device_sample_check": device_check,
         "data_load_seconds": load_seconds, "test_split_used": False,
     }
